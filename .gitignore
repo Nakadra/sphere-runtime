@@ -1,1 +1,9 @@
+# Compiled files
 /target
+
+# IDE configuration files
+.idea/
+*.vscode/
+
+# Local environment files
+.env/target
