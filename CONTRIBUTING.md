@@ -36,7 +36,7 @@ To suggest an enhancement:
 We use the "fork-and-pull" model for contributions. Here’s a quick guide:
 
 1.  **Fork the repository** on GitHub.
-2.  **Clone your fork** to your local machine: `git clone https://github.com/YOUR-USERNAME/sphere-runtime.git`
+2.  **Clone your fork** to your local machine: `git clone https://github.com/Nakadra/sphere-runtime.git`
 3.  **Create a new branch** for your changes: `git checkout -b name-of-your-feature-or-fix`
 4.  **Make your changes.** Write your code and add tests if applicable.
 5.  **Commit your changes** with a clear commit message: `git commit -m "feat: Add a new feature"` or `git commit -m "fix: Solve a bug"`
