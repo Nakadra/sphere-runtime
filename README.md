@@ -37,7 +37,7 @@ Currently, you can install Sphere by building from source.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Clone the repository
-git clone https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
+git clone https://github.com/Nakadra/sphere-runtime.git
 cd sphere-runtime
 
 # Build the release binary
