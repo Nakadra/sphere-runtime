@@ -1,0 +1,2 @@
+id = "com.dev.sandbox-test/v0.1"
+entrypoint = "echo '--- Testing Sandbox ---'; echo 'Running whoami...'; whoami; echo 'My current directory is:'; pwd; echo 'Creating a file inside the sandbox...'; touch 'im_in_the_sandbox.txt'; echo 'Listing files in my directory:'; ls -l; echo '--- Now, trying to escape... ---'; echo 'Attempting to list files in the parent directory:'; ls ../"
