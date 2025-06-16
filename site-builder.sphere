@@ -1,0 +1,8 @@
+entrypoint = """
+echo "--- Website Builder v1 ---"
+echo "<h1>Welcome to My Website!</h1>" > index.html
+echo "<p>This site was built by a Sphere.</p>" >> index.html
+echo "Site 'index.html' created."
+echo "--- Contents of current directory: ---"
+ls
+"""

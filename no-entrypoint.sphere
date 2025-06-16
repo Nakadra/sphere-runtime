@@ -1,0 +1,2 @@
+# This Sphere is valid TOML but has no entrypoint
+id = "com.test.no-entrypoint/v1"

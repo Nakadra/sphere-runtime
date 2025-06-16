@@ -1,16 +1,15 @@
 // --- Imports ---
-use clap::Parser; // The main clap import
+use clap::Parser;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write; // Needed for creating files
+use std::io::Write;
 use std::error::Error;
-use std::path::PathBuf; // For handling file paths
+use std::path::{Path, PathBuf}; // Import Path for function signature
 use std::process::Command;
 use tempfile::tempdir;
 
 // --- CLI Definition ---
-/// A next-generation, sandboxed command runner
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -22,8 +21,6 @@ struct Cli {
 // --- Data Structures ---
 #[derive(Deserialize, Debug)]
 struct SphereProcess {
-    // We are not using 'id' yet, so it is commented out to prevent warnings.
-    // id: String, 
     entrypoint: String,
     dependencies: Option<HashMap<String, String>>,
 }
@@ -33,17 +30,14 @@ struct Dependency {
     process: SphereProcess,
 }
 
-
-// --- Main Application Logic ---
-fn main() -> Result<(), Box<dyn Error>> {
-    // 1. Parse Command-Line Arguments
-    let cli = Cli::parse();
-
-    // --- PARSING LOGIC (Uses the CLI argument) ---
-    let content = fs::read_to_string(&cli.file_path)?;
+// --- Main Application Logic (in its own function) ---
+fn run_sphere(file_path: &Path) -> Result<(), Box<dyn Error>> {
+    // --- PARSING LOGIC ---
+    let content = fs::read_to_string(file_path)?;
     let sphere_process: SphereProcess = toml::from_str(&content)?;
     println!("-> Parsed entrypoint: '{}'", &sphere_process.entrypoint);
 
+    // ... (The rest of the logic is IDENTICAL to before) ...
     // --- DEPENDENCY RESOLUTION ---
     let mut resolved_deps: Vec<Dependency> = Vec::new();
     if let Some(deps) = &sphere_process.dependencies {
@@ -75,8 +69,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-
-    // --- SANDBOX SETUP & EXECUTION ---
+    // --- SANDBOX & EXECUTION ---
     let temp_dir = tempdir()?;
     println!("-> Created secure sandbox at: {:?}", temp_dir.path());
     let bin_path = temp_dir.path().join("bin");
@@ -85,19 +78,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     for dep in &resolved_deps {
         let script_path = bin_path.join(&dep.alias);
         let mut script_file = fs::File::create(&script_path)?;
-        
-        // This is the corrected block for setting file permissions.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            // Step 1: Get the permissions object into a mutable variable.
             let mut perms = script_file.metadata()?.permissions();
-            // Step 2: Modify the object in-place.
-            perms.set_mode(0o755); // rwxr-xr-x
-            // Step 3: Apply the modified permissions object back to the file.
+            perms.set_mode(0o755);
             fs::set_permissions(&script_path, perms)?;
         }
-
         writeln!(script_file, "#!/bin/sh")?;
         writeln!(script_file, "{}", dep.process.entrypoint)?;
     }
@@ -114,7 +101,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         .output()?;
     println!("-> Execution finished.\n");
     
-    // --- OUTPUT HANDLING ---
     println!("--- Command STDOUT ---");
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     println!("{}", stdout);
@@ -128,4 +114,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+
+// --- Main function: A more robust error handler ---
+fn main() {
+    let cli = Cli::parse();
+    
+    if let Err(e) = run_sphere(&cli.file_path) {
+        // Try to downcast the error to a TOML deserialization error.
+        if let Some(toml_error) = e.downcast_ref::<toml::de::Error>() {
+            // Now we know it's a TOML error, we can check its message.
+            if toml_error.message().contains("missing field `entrypoint`") {
+                eprintln!("\nError: The file '{}' is missing the required 'entrypoint' field.", cli.file_path.display());
+            } else {
+                // It's a different kind of TOML error (e.g., syntax error)
+                eprintln!("\nError: Failed to parse '{}'.", cli.file_path.display());
+                eprintln!("Reason: {}", toml_error);
+            }
+        } else {
+            // It's some other kind of error (e.g., file not found, permission denied).
+            eprintln!("\nApplication error: {}", e);
+        }
+        
+        std::process::exit(1);
+    }
 }
