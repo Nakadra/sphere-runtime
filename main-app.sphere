@@ -2,8 +2,4 @@ id = "com.apps.main-app/v1"
 entrypoint = "echo 'Main app starting...'; greeter-v1; echo 'Main app finished.'"
 
 [dependencies]
-# We are 'aliasing' the Sphere with id 'com.util.greeter/v1'
-# to be available as the command 'greeter-v1'.
 greeter-v1 = "com.util.greeter/v1"
-# This ID does not exist in our index.json
-archiver = "com.tools.non-existent/v1"
