@@ -74,4 +74,4 @@ This project is built by the community, for the community. We welcome all contri
 
 ---
 
-*Built with ❤️ in Nairobi, Kenya.*
+*Built with ❤️ by Clein Pius, Kelly Gregory, and Ronald Oloo in Nairobi, Kenya.*
