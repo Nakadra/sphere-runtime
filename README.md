@@ -58,6 +58,7 @@ Run it:
 ```bash
 sphere hello.sphere
 ```
+---
 
 ### The Roadmap
 
@@ -74,4 +75,11 @@ This project is built by the community, for the community. We welcome all contri
 
 ---
 
+### Community & Support
+
+Join our community on Discord to ask questions, share ideas, and chat with the developers and other users!
+
+[Join the Sphere Discord Server](https://discord.gg/ZnUCaUGr) 
+
+---
 *Built with ❤️ by Clein Pius, Kelly Gregory, and Ronald Oloo in Nairobi, Kenya.*
