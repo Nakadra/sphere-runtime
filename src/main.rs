@@ -5,17 +5,22 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::error::Error;
-use std::path::{Path, PathBuf}; // Import Path for function signature
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
 // --- CLI Definition ---
+/// A next-generation, sandboxed command runner
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
     /// The .sphere file to execute
     #[arg(required = true)]
     file_path: PathBuf,
+
+    /// Run in quiet mode, suppressing status messages
+    #[arg(short, long)]
+    quiet: bool,
 }
 
 // --- Data Structures ---
@@ -30,25 +35,30 @@ struct Dependency {
     process: SphereProcess,
 }
 
-// --- Main Application Logic (in its own function) ---
-fn run_sphere(file_path: &Path) -> Result<(), Box<dyn Error>> {
+// --- Main Application Logic ---
+fn run_sphere(file_path: &Path, quiet_mode: bool) -> Result<(), Box<dyn Error>> {
     // --- PARSING LOGIC ---
     let content = fs::read_to_string(file_path)?;
     let sphere_process: SphereProcess = toml::from_str(&content)?;
-    println!("-> Parsed entrypoint: '{}'", &sphere_process.entrypoint);
+    if !quiet_mode {
+        println!("-> Parsed entrypoint: '{}'", &sphere_process.entrypoint);
+    }
 
-    // ... (The rest of the logic is IDENTICAL to before) ...
     // --- DEPENDENCY RESOLUTION ---
     let mut resolved_deps: Vec<Dependency> = Vec::new();
     if let Some(deps) = &sphere_process.dependencies {
-        println!("-> Resolving dependencies...");
+        if !quiet_mode {
+            println!("-> Resolving dependencies...");
+        }
         
         let home = std::env::var("HOME")?;
         let cache_dir = format!("{}/.sphere/cache", home);
         let index_path = format!("{}/index.json", cache_dir);
         let index_content = fs::read_to_string(index_path)?;
         let index: HashMap<String, String> = serde_json::from_str(&index_content)?;
-        println!("   - Loaded cache index.");
+        if !quiet_mode {
+            println!("   - Loaded cache index.");
+        }
 
         for (alias, sphere_id) in deps {
             let dep_filename = index.get(sphere_id).ok_or_else(|| {
@@ -57,7 +67,9 @@ fn run_sphere(file_path: &Path) -> Result<(), Box<dyn Error>> {
             
             let dep_path = format!("{}/{}", cache_dir, dep_filename);
             
-            println!("   - Loading '{}' as '{}' from {}", sphere_id, alias, dep_path);
+            if !quiet_mode {
+                println!("   - Loading '{}' as '{}' from {}", sphere_id, alias, dep_path);
+            }
 
             let dep_content = fs::read_to_string(&dep_path)?;
             let dep_process: SphereProcess = toml::from_str(&dep_content)?;
@@ -71,7 +83,9 @@ fn run_sphere(file_path: &Path) -> Result<(), Box<dyn Error>> {
 
     // --- SANDBOX & EXECUTION ---
     let temp_dir = tempdir()?;
-    println!("-> Created secure sandbox at: {:?}", temp_dir.path());
+    if !quiet_mode {
+        println!("-> Created secure sandbox at: {:?}", temp_dir.path());
+    }
     let bin_path = temp_dir.path().join("bin");
     fs::create_dir(&bin_path)?;
 
@@ -92,24 +106,33 @@ fn run_sphere(file_path: &Path) -> Result<(), Box<dyn Error>> {
     let original_path = std::env::var("PATH").unwrap_or_default();
     let new_path = format!("{}:{}", bin_path.to_str().unwrap(), original_path);
     
-    println!("-> Executing entrypoint inside sandbox...");
+    if !quiet_mode {
+        println!("-> Executing entrypoint inside sandbox...");
+    }
     let output = Command::new("sh")
         .arg("-c")
         .arg(&sphere_process.entrypoint)
         .current_dir(temp_dir.path())
         .env("PATH", new_path)
         .output()?;
-    println!("-> Execution finished.\n");
+    if !quiet_mode {
+        println!("-> Execution finished.\n");
+    }
     
-    println!("--- Command STDOUT ---");
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    println!("{}", stdout);
-    println!("----------------------");
+    // --- OUTPUT HANDLING (Always print STDOUT/STDERR from the Sphere itself) ---
+    // Check if STDOUT has content before printing headers to avoid empty blocks
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    if !stdout_str.trim().is_empty() {
+        println!("--- Command STDOUT ---");
+        println!("{}", stdout_str.trim());
+        println!("----------------------");
+    }
 
-    if !output.stderr.is_empty() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    // Check if STDERR has content
+    let stderr_str = String::from_utf8_lossy(&output.stderr);
+    if !stderr_str.trim().is_empty() {
         println!("\n--- Command STDERR ---");
-        println!("{}", stderr);
+        println!("{}", stderr_str.trim());
         println!("----------------------");
     }
 
@@ -117,23 +140,19 @@ fn run_sphere(file_path: &Path) -> Result<(), Box<dyn Error>> {
 }
 
 
-// --- Main function: A more robust error handler ---
+// --- Main function: Parser, error handler, and now passes quiet flag ---
 fn main() {
     let cli = Cli::parse();
     
-    if let Err(e) = run_sphere(&cli.file_path) {
-        // Try to downcast the error to a TOML deserialization error.
+    if let Err(e) = run_sphere(&cli.file_path, cli.quiet) {
         if let Some(toml_error) = e.downcast_ref::<toml::de::Error>() {
-            // Now we know it's a TOML error, we can check its message.
             if toml_error.message().contains("missing field `entrypoint`") {
                 eprintln!("\nError: The file '{}' is missing the required 'entrypoint' field.", cli.file_path.display());
             } else {
-                // It's a different kind of TOML error (e.g., syntax error)
                 eprintln!("\nError: Failed to parse '{}'.", cli.file_path.display());
                 eprintln!("Reason: {}", toml_error);
             }
         } else {
-            // It's some other kind of error (e.g., file not found, permission denied).
             eprintln!("\nApplication error: {}", e);
         }
         
