@@ -1,32 +1,69 @@
 // --- Imports ---
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use serde::Deserialize;
+use serde_json;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
 
-// --- CLI Definition ---
-/// A next-generation, sandboxed command runner
+// --- CLI Definition using clap ---
 #[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
+#[command(author, version, about, long_about = None)]
 struct Cli {
-    /// The .sphere file to execute
-    #[arg(required = true)]
-    file_path: PathBuf,
+    #[command(subcommand)]
+    command: Commands,
 
     /// Run in quiet mode, suppressing status messages
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     quiet: bool,
 }
 
-// --- Data Structures ---
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run a .sphere file
+    Run {
+        /// The .sphere file to execute
+        #[arg(required = true)]
+        file_path: PathBuf,
+    },
+    /// Manage the local Sphere cache
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum CacheAction {
+    /// List all Spheres in the local cache index
+    List,
+    /// Add a Sphere to the local cache index
+    Add {
+        /// The unique ID of the Sphere (e.g., com.example/my-tool/v1)
+        #[arg(required = true)]
+        id: String,
+        /// The path to the .sphere file to add
+        #[arg(required = true)]
+        file_path: PathBuf,
+        /// Optionally copy the file into the cache directory
+        #[arg(long)]
+        copy_to_cache: bool,
+    },
+    /// Remove a Sphere from the local cache index
+    Remove {
+        /// The unique ID of the Sphere to remove
+        #[arg(required = true)]
+        id: String,
+    },
+}
+
+// --- Data Structures for Sphere ---
 #[derive(Deserialize, Debug)]
 struct SphereProcess {
-    // id: String, // Commented out to avoid dead_code warning for now
     entrypoint: String,
     dependencies: Option<HashMap<String, String>>,
 }
@@ -36,75 +73,126 @@ struct Dependency {
     process: SphereProcess,
 }
 
-// --- Main Application Logic (in its own function) ---
-fn run_sphere(cli_args: &Cli) -> Result<(), Box<dyn Error>> { // Pass the whole Cli struct for the quiet flag
-    // --- PARSING LOGIC ---
-    let content = fs::read_to_string(&cli_args.file_path)?;
-    let sphere_process: SphereProcess = toml::from_str(&content)?;
+// --- Helper Functions for Cache Management ---
+fn get_cache_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
+    let home_dir = std::env::var("HOME")?;
+    let cache_root = PathBuf::from(home_dir).join(".sphere");
+    let cache_dir = cache_root.join("cache");
+    fs::create_dir_all(&cache_dir)?;
+    let index_path = cache_dir.join("index.json");
+    Ok((cache_dir, index_path))
+}
+
+fn load_cache_index(index_path: &Path) -> Result<HashMap<String, String>, Box<dyn Error>> {
+    if !index_path.exists() {
+        return Ok(HashMap::new());
+    }
+    let index_content = fs::read_to_string(index_path)?;
+    if index_content.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+    let index: HashMap<String, String> = serde_json::from_str(&index_content)?;
+    Ok(index)
+}
+
+fn save_cache_index(index_path: &Path, index: &HashMap<String, String>) -> Result<(), Box<dyn Error>> {
+    let index_content = serde_json::to_string_pretty(index)?;
+    fs::write(index_path, index_content)?;
+    Ok(())
+}
+
+// --- Cache Command Handlers ---
+fn handle_cache_list(quiet: bool) -> Result<(), Box<dyn Error>> {
+    if !quiet {
+        println!("-> Listing Spheres in local cache index...");
+    }
+    let (_cache_dir, index_path) = get_cache_paths()?;
+    let index = load_cache_index(&index_path)?;
+
+    if index.is_empty() {
+        println!("   Cache index is empty or not found at '{}'.", index_path.display());
+    } else {
+        if !quiet {
+            println!("   Cache index location: '{}'", index_path.display());
+        }
+        println!("   --------------------------------------------------");
+        println!("   Sphere ID                             | Filename");
+        println!("   --------------------------------------------------");
+        let mut sorted_index: Vec<_> = index.into_iter().collect();
+        sorted_index.sort_by(|a, b| a.0.cmp(&b.0));
+        for (id, filename) in sorted_index {
+            println!("   {:<35} | {}", id, filename);
+        }
+        println!("   --------------------------------------------------");
+    }
+    Ok(())
+}
+
+fn handle_cache_add(id: &str, file_path: &PathBuf, copy_to_cache: bool, quiet: bool) -> Result<(), Box<dyn Error>> {
+    if !quiet {
+        println!("-> (Not Implemented Yet) Adding Sphere ID: {}", id);
+        println!("   File path: {}", file_path.display());
+        println!("   Copy to cache: {}", copy_to_cache);
+    }
+    // TODO: Implement actual logic
+    Ok(())
+}
+
+fn handle_cache_remove(id: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
+    if !quiet {
+        println!("-> (Not Implemented Yet) Removing Sphere ID: {}", id);
+    }
+    // TODO: Implement actual logic
+    Ok(())
+}
+
+// --- Main Application Logic for 'sphere run' ---
+fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
+    let content = fs::read_to_string(file_path)
+        .map_err(|e| format!("Failed to read sphere file '{}': {}", file_path.display(), e))?;
+    let sphere_process: SphereProcess = toml::from_str(&content)
+        .map_err(|e| format!("Failed to parse TOML from '{}': {}", file_path.display(), e))?;
     
-    if !cli_args.quiet {
-        println!("-> Parsed entrypoint: '{}'", &sphere_process.entrypoint);
+    if !quiet {
+        println!("-> Parsed entrypoint: '{}' from '{}'", &sphere_process.entrypoint, file_path.display());
     }
 
-    // --- DEPENDENCY RESOLUTION ---
     let mut resolved_deps: Vec<Dependency> = Vec::new();
     if let Some(deps) = &sphere_process.dependencies {
-        if !cli_args.quiet {
+        if !quiet {
             println!("-> Resolving dependencies...");
         }
-        
-        let home = std::env::var("HOME")?;
-        let cache_dir = format!("{}/.sphere/cache", home);
-        let index_path = format!("{}/index.json", cache_dir);
-        let index_content = fs::read_to_string(&index_path)
-            .map_err(|e| format!("Failed to read cache index at '{}': {}", index_path, e))?; // Improved error for index
-        
-        let index: HashMap<String, String> = serde_json::from_str(&index_content)
-            .map_err(|e| format!("Failed to parse cache index at '{}': {}", index_path, e))?; // Improved error for index parsing
-        
-        if !cli_args.quiet {
-            println!("   - Loaded cache index.");
+        let (cache_dir, index_path) = get_cache_paths()?;
+        let index = load_cache_index(&index_path)?;
+        if !quiet && !index.is_empty() {
+             println!("   - Loaded cache index from '{}'.", index_path.display());
+        } else if !quiet && index.is_empty() {
+             println!("   - Cache index at '{}' is empty or not found.", index_path.display());
         }
+
 
         for (alias, sphere_id) in deps {
             let dep_filename = index.get(sphere_id).ok_or_else(|| {
-                format!("Dependency ID '{}' (aliased as '{}') not found in cache index ('{}').", sphere_id, alias, index_path)
+                format!("Dependency ID '{}' (aliased as '{}') not found in cache index!", sphere_id, alias)
             })?;
-            
-            let dep_path_str = format!("{}/{}", cache_dir, dep_filename); // Keep as String for format!
-            let dep_path = PathBuf::from(&dep_path_str); // Convert to PathBuf for fs operations
-            
-            if !cli_args.quiet {
-                println!("   - Loading '{}' as '{}' from {}", sphere_id, alias, dep_path.display());
+            let dep_path = cache_dir.join(dep_filename);
+            if !quiet {
+                println!("   - Loading dependency '{}' (Sphere ID: '{}') from '{}'", alias, sphere_id, dep_path.display());
             }
 
             let dep_content = fs::read_to_string(&dep_path)
                 .map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
-                        let err_msg = format!(
+                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!(
                             "Dependency file '{}' (for Sphere ID '{}', aliased as '{}') not found in cache at path '{}'. Please ensure it is installed correctly.",
-                            dep_filename,
-                            sphere_id,
-                            alias, // Added alias for better context
-                            dep_path.display()
-                        );
-                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, err_msg)) as Box<dyn Error>
+                            dep_filename, sphere_id, alias, dep_path.display()
+                        ))) as Box<dyn Error>
                     } else {
-                        let err_msg = format!(
-                            "Failed to read dependency file '{}' (for Sphere ID '{}', aliased as '{}') from path '{}': {}",
-                            dep_filename,
-                            sphere_id,
-                            alias,
-                            dep_path.display(),
-                            e
-                        );
-                        Box::new(std::io::Error::new(e.kind(), err_msg)) as Box<dyn Error> // Preserve original error kind if possible
+                        Box::new(e) as Box<dyn Error>
                     }
                 })?;
-            
             let dep_process: SphereProcess = toml::from_str(&dep_content)
-                .map_err(|e| format!("Failed to parse dependency Sphere file '{}' (for Sphere ID '{}', aliased as '{}'): {}", dep_filename, sphere_id, alias, e))?;
-
+                .map_err(|e| format!("Failed to parse TOML for dependency '{}': {}", sphere_id, e))?;
 
             resolved_deps.push(Dependency {
                 alias: alias.clone(),
@@ -113,10 +201,8 @@ fn run_sphere(cli_args: &Cli) -> Result<(), Box<dyn Error>> { // Pass the whole 
         }
     }
 
-
-    // --- SANDBOX & EXECUTION ---
     let temp_dir = tempdir()?;
-    if !cli_args.quiet {
+    if !quiet {
         println!("-> Created secure sandbox at: {:?}", temp_dir.path());
     }
     let bin_path = temp_dir.path().join("bin");
@@ -133,15 +219,13 @@ fn run_sphere(cli_args: &Cli) -> Result<(), Box<dyn Error>> { // Pass the whole 
             fs::set_permissions(&script_path, perms)?;
         }
         writeln!(script_file, "#!/bin/sh")?;
-        // NEW: Ensure the dependency also respects quiet mode if we decide to pass it down
-        // For now, dependency scripts run as defined in their entrypoint
         writeln!(script_file, "{}", dep.process.entrypoint)?;
     }
     
     let original_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{}", bin_path.to_str().unwrap(), original_path);
+    let new_path = format!("{}:{}", bin_path.to_string_lossy(), original_path);
     
-    if !cli_args.quiet {
+    if !quiet {
         println!("-> Executing entrypoint inside sandbox...");
     }
     let output = Command::new("sh")
@@ -150,55 +234,85 @@ fn run_sphere(cli_args: &Cli) -> Result<(), Box<dyn Error>> { // Pass the whole 
         .current_dir(temp_dir.path())
         .env("PATH", new_path)
         .output()?;
-    
-    if !cli_args.quiet {
+    if !quiet {
         println!("-> Execution finished.\n");
     }
     
-    // Always print STDOUT and STDERR from the executed command, regardless of quiet mode
-    if !output.stdout.is_empty() {
-        // No "--- Command STDOUT ---" header in quiet mode for cleaner scripting output
-        if !cli_args.quiet { println!("--- Command STDOUT ---"); }
-        // Use print! and manually add newline for precise control, or handle if stdout already has one
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        print!("{}", stdout_str); // Use print! not println! if output has its own newlines
-        if !cli_args.quiet && !stdout_str.ends_with('\n') { println!(); } // Add newline if not present in quiet mode off
-        if !cli_args.quiet { println!("----------------------"); }
+    if !quiet { // Only print STDOUT/STDERR block headers if not in quiet mode
+        println!("--- Command STDOUT ---");
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stdout.is_empty() {
+        println!("{}", stdout);
+    } else if !quiet { // Only print (empty) if not quiet and stdout is empty
+        println!("(empty)");
+    }
+    if !quiet {
+        println!("----------------------");
     }
 
 
     if !output.stderr.is_empty() {
-        // No "--- Command STDERR ---" header in quiet mode
-        if !cli_args.quiet { eprintln!("\n--- Command STDERR ---"); } // eprintln for stderr
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr_str); // Use eprint!
-        if !cli_args.quiet && !stderr_str.ends_with('\n') { eprintln!(); }
-        if !cli_args.quiet { eprintln!("----------------------"); }
+        if !quiet { // Only print STDERR block headers if not in quiet mode
+            println!("\n--- Command STDERR ---");
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        println!("{}", stderr); // Always print stderr content if it exists
+        if !quiet {
+            println!("----------------------");
+        }
     }
-
     Ok(())
 }
 
-
-// --- Main function: Now just a simple parser and error handler ---
+// --- Main function: Parses CLI args and dispatches to handlers ---
 fn main() {
     let cli = Cli::parse();
-    
-    if let Err(e) = run_sphere(&cli) { // Pass the whole cli struct
-        // Try to downcast the error to a TOML deserialization error.
+
+    let result = match &cli.command { // Borrow cli.command
+        Commands::Run { file_path } => {
+            run_sphere(file_path, cli.quiet)
+        }
+        Commands::Cache { action } => match action { // action is already a reference due to 'ref'
+            CacheAction::List => {
+                handle_cache_list(cli.quiet)
+            }
+            CacheAction::Add { id, file_path, copy_to_cache } => {
+                handle_cache_add(id, file_path, *copy_to_cache, cli.quiet) // Dereference copy_to_cache
+            }
+            CacheAction::Remove { id } => {
+                handle_cache_remove(id, cli.quiet)
+            }
+        },
+    };
+
+    if let Err(e) = result {
+        let mut error_message = format!("{}", e);
+        let mut specific_error_handled = false;
+        let mut file_path_for_error: Option<String> = None;
+
+        if let Commands::Run { ref file_path } = cli.command {
+            file_path_for_error = Some(file_path.display().to_string());
+        }
+
         if let Some(toml_error) = e.downcast_ref::<toml::de::Error>() {
             if toml_error.message().contains("missing field `entrypoint`") {
-                eprintln!("\nError: The file '{}' is missing the required 'entrypoint' field.", cli.file_path.display());
-            } else {
-                eprintln!("\nError: Failed to parse Sphere file '{}'.", cli.file_path.display());
-                eprintln!("Reason: {}", toml_error);
+                let path_str = file_path_for_error.as_deref().unwrap_or("the .sphere file");
+                error_message = format!("The file '{}' is missing the required 'entrypoint' field.", path_str);
+                specific_error_handled = true;
+            } else if file_path_for_error.is_some() {
+                 error_message = format!("Failed to parse TOML from '{}'. Reason: {}", file_path_for_error.unwrap(), toml_error);
+                 specific_error_handled = true;
             }
-        } else {
-            // For other errors, just print their message directly.
-            // Our custom errors created with Box::new(std::io::Error::new(...)) will print cleanly.
-            eprintln!("\nApplication error: {}", e);
         }
         
+        if !specific_error_handled {
+            if !e.to_string().starts_with("Dependency file") && !e.to_string().starts_with("Failed to read sphere file") && !e.to_string().starts_with("Failed to parse TOML from") {
+                 error_message = format!("Application error: {}", e);
+            }
+        }
+        
+        eprintln!("\nError: {}", error_message.trim());
         std::process::exit(1);
     }
 }
