@@ -9,3 +9,4 @@ toml = "0.8"
 tempfile = "3.10"
 serde_json = "1.0"
 clap = { version = "4.5", features = ["derive"] } # <-- ADD THIS
+sha2 = "0.10" # <-- NEW DEPENDENCY

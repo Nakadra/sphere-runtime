@@ -4,11 +4,12 @@ use serde::Deserialize;
 use serde_json;
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
+use std::io::{self, BufRead, Write}; // Added BufRead for stdin, Write for stdout().flush()
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
+use sha2::{Sha256, Digest}; // For SHA256 hashing
 
 // --- CLI Definition using clap ---
 #[derive(Parser, Debug)]
@@ -35,6 +36,12 @@ enum Commands {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Publish a .sphere file to the SphereHub (generates PR instructions)
+    Publish {
+        /// The .sphere file to prepare for publishing
+        #[arg(required = true)]
+        file_path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -48,7 +55,7 @@ enum CacheAction {
         id: String,
         /// The path to the .sphere file to add
         #[arg(required = true)]
-        sphere_file_path: PathBuf, // Renamed for clarity in this context
+        sphere_file_path: PathBuf,
         /// Optionally copy the file into the cache directory
         #[arg(long)]
         copy_to_cache: bool,
@@ -64,6 +71,7 @@ enum CacheAction {
 // --- Data Structures for Sphere ---
 #[derive(Deserialize, Debug)]
 struct SphereProcess {
+    id: Option<String>, 
     entrypoint: String,
     dependencies: Option<HashMap<String, String>>,
 }
@@ -103,6 +111,20 @@ fn save_cache_index(index_path: &Path, index: &HashMap<String, String>) -> Resul
         .map_err(|e| format!("Failed to save cache index to '{}': {}", index_path.display(), e))?;
     Ok(())
 }
+
+// --- Helper function for user input ---
+fn prompt_for_input(prompt_message: &str) -> Result<String, Box<dyn Error>> {
+    print!("{}", prompt_message);
+    io::stdout().flush()?; 
+    let mut input = String::new();
+    io::stdin().lock().read_line(&mut input)?;
+    let trimmed_input = input.trim().to_string();
+    if trimmed_input.is_empty() {
+        return Err("Input cannot be empty.".into());
+    }
+    Ok(trimmed_input)
+}
+
 
 // --- Cache Command Handlers ---
 fn handle_cache_list(quiet: bool) -> Result<(), Box<dyn Error>> {
@@ -159,22 +181,18 @@ fn handle_cache_add(id: &str, sphere_file_path_arg: &PathBuf, copy_to_cache: boo
     let sphere_filename_in_index: String;
 
     if copy_to_cache {
-        // Derive a safe filename for the cache from the ID
         let mut cached_file_name = id.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-', "_");
         if !cached_file_name.ends_with(".sphere") {
             cached_file_name.push_str(".sphere");
         }
-        // Ensure it's not empty after sanitizing if ID was all special chars
         if cached_file_name == ".sphere" || cached_file_name.is_empty() {
              cached_file_name = format!("sphere_{}.sphere", id.chars().filter(|c| c.is_alphanumeric()).collect::<String>());
-             if cached_file_name == "sphere_.sphere" { // if ID had no alphanumerics
+             if cached_file_name == "sphere_.sphere" {
                 return Err("Cannot derive a valid cache filename from the provided ID. Please use an ID with alphanumeric characters.".into());
              }
         }
 
-
         let target_cache_path = cache_dir.join(&cached_file_name);
-
         if target_cache_path.exists() {
             return Err(format!(
                 "A file named '{}' (derived from ID '{}') already exists in the cache directory '{}'. \
@@ -185,8 +203,7 @@ fn handle_cache_add(id: &str, sphere_file_path_arg: &PathBuf, copy_to_cache: boo
 
         fs::copy(sphere_file_path_arg, &target_cache_path)
             .map_err(|e| format!("Failed to copy '{}' to '{}': {}", sphere_file_path_arg.display(), target_cache_path.display(), e))?;
-        
-        sphere_filename_in_index = cached_file_name; // Store relative filename for copied files
+        sphere_filename_in_index = cached_file_name;
         if !quiet {
             println!("   Successfully copied '{}' to '{}'", sphere_file_path_arg.display(), target_cache_path.display());
         }
@@ -212,40 +229,141 @@ fn handle_cache_remove(id: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
     if !quiet {
         println!("-> Removing Sphere ID '{}' from local cache index...", id);
     }
-
     let (_cache_dir, index_path) = get_cache_paths()?;
     let mut index = load_cache_index(&index_path)?;
 
-    // Validation: Check if ID exists
     if !index.contains_key(id) {
         return Err(format!("Sphere ID '{}' not found in the cache index. Nothing to remove.", id).into());
     }
-
-    // Remove the entry
-    let removed_file_path = index.remove(id); // .remove() returns the value if the key existed
-
+    let removed_file_path_str = index.remove(id); // .remove() returns Option<String>
     save_cache_index(&index_path, &index)?;
 
     if !quiet {
         println!("   Successfully removed Sphere ID '{}' from the index.", id);
-        if let Some(path) = removed_file_path {
-            // Check if the path was likely a cached file (relative) vs an absolute path
-            if Path::new(&path).is_relative() && !path.starts_with('/') && !path.starts_with("~") {
-                 println!("   Note: The associated file '{}' in the cache directory was NOT deleted.", path);
-                 println!("   If it was copied to cache, you may want to remove it manually from: {}/{}", _cache_dir.display(), path);
+        if let Some(path_str) = removed_file_path_str { 
+            let path_obj = Path::new(&path_str);
+            // A simple heuristic: if it doesn't contain typical absolute path indicators and is not empty
+            let probably_copied_to_cache = !path_str.starts_with('/') && !path_str.starts_with('~') && !path_obj.is_absolute();
+
+            if probably_copied_to_cache {
+                 println!("   Note: The associated file entry was '{}'. If this was copied to cache, the file itself was NOT deleted.", path_str);
+                 println!("   You may want to remove it manually from: {}/{}", _cache_dir.display(), path_str);
             } else {
-                 println!("   Note: The index entry pointed to an external file at '{}'. This file was NOT deleted.", path);
+                 println!("   Note: The index entry pointed to an external file at '{}'. This file was NOT deleted.", path_str);
             }
         }
     }
     Ok(())
 }
 
+// --- Publish Command Handler ---
+fn handle_sphere_publish(file_path: &PathBuf, quiet: bool) -> Result<(), Box<dyn Error>> {
+    if !quiet {
+        println!("-> Preparing to publish Sphere from: {}", file_path.display());
+        println!("   (This command will guide you to create a Pull Request to the SphereHub registry)");
+        println!("---");
+    }
+
+    // 1. Validate file_path exists and is a file.
+    if !file_path.exists() {
+        return Err(format!("Sphere file '{}' does not exist.", file_path.display()).into());
+    }
+    if !file_path.is_file() {
+        return Err(format!("Path '{}' is not a file.", file_path.display()).into());
+    }
+
+    // 2. Parse .sphere file into SphereProcess.
+    let sphere_content_str = fs::read_to_string(file_path)
+        .map_err(|e| format!("Failed to read sphere file '{}': {}", file_path.display(), e))?;
+    let sphere_process: SphereProcess = toml::from_str(&sphere_content_str)
+        .map_err(|e| format!("Failed to parse TOML from '{}': {}", file_path.display(), e))?;
+
+    // 3. Validate 'id' field.
+    let sphere_id = match &sphere_process.id {
+        Some(id_str) if !id_str.trim().is_empty() => id_str.trim().to_string(),
+        _ => return Err(format!(
+            "The .sphere file at '{}' must contain a valid, non-empty 'id' field (e.g., 'com.example/my-tool/v1.0.0') for publishing.",
+            file_path.display()
+        ).into()),
+    };
+    
+    if !quiet {
+        println!("   Publishing Sphere with ID: {}", sphere_id);
+    }
+
+    // 4. Prompt user for Author/Maintainer.
+    let author = prompt_for_input("   Enter your GitHub username or author name for this Sphere: ")?;
+
+    // 5. Prompt user for Description.
+    let description = prompt_for_input("   Enter a short, one-line description for this Sphere: ")?;
+
+    // 6. Calculate SHA256 hash of the file content.
+    let mut hasher = Sha256::new();
+    hasher.update(sphere_content_str.as_bytes());
+    let hash_bytes = hasher.finalize();
+    let hash_hex = format!("{:x}", hash_bytes); 
+    
+    if !quiet {
+        println!("   Calculated SHA256 hash: {}", hash_hex);
+    }
+
+    // 7. Derive cached filename from Sphere ID.
+    let mut derived_filename = sphere_id.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-', "_");
+    if !derived_filename.ends_with(".sphere") {
+        derived_filename.push_str(".sphere");
+    }
+    if derived_filename == ".sphere" || derived_filename.is_empty() {
+         derived_filename = format!("sphere_{}.sphere", sphere_id.chars().filter(|c| c.is_alphanumeric()).collect::<String>());
+         if derived_filename == "sphere_.sphere" {
+             return Err("Cannot derive a valid cache filename from the Sphere ID. Please use an ID with alphanumeric characters.".into());
+         }
+    }
+    
+    if !quiet {
+        println!("   Derived filename for SphereHub: {}", derived_filename);
+        println!("---");
+    }
+
+    // 8. Print detailed PR instructions.
+    println!("\n===== Sphere Publishing Instructions (Manual PR Required for MVP) =====");
+    println!("Sphere CLI has prepared the following information for your Sphere '{}':", sphere_id);
+    println!("\n1. Sphere ID:      {}", sphere_id);
+    println!("2. Author:         {}", author);
+    println!("3. Description:    {}", description);
+    println!("4. Content SHA256: {}", hash_hex);
+    println!("5. Hub Filename:   {}", derived_filename);
+    println!("\nTo publish this Sphere to the public SphereHub registry (https://github.com/Nakadra/sphere-hub-registry), please follow these steps:");
+    println!("   a. Fork the repository `Nakadra/sphere-hub-registry` to your own GitHub account if you haven't already.");
+    println!("   b. Clone your fork locally: `git clone https://github.com/YOUR_USERNAME/sphere-hub-registry.git`");
+    println!("   c. Create a new branch in your fork: `git checkout -b add-sphere-{}", sphere_id.replace(|c: char| !c.is_alphanumeric(), "-")); // Sanitize for branch name
+    println!("   d. Add your Sphere file content:");
+    println!("      - Create/edit the file in your cloned fork: `registry/spheres/{}`", derived_filename);
+    println!("      - Paste the exact content of your original '{}' into this new file.", file_path.display());
+    println!("   e. Update the master index:");
+    println!("      - Open the file: `registry/index.json` in your fork.");
+    println!("      - Add a new entry for your Sphere. Ensure it's valid JSON. If adding to an existing JSON object, add a comma before your new key if needed.");
+    println!("        Your entry should look like this (adjust formatting as needed):");
+    println!("        \"{}\": {{", sphere_id); // Key
+    println!("          \"filename\": \"{}\",", derived_filename);
+    println!("          \"description\": \"{}\",", description);
+    println!("          \"author\": \"{}\",", author);
+    println!("          \"hash_sha256\": \"{}\"", hash_hex);
+    println!("        }}");
+    println!("   f. Commit your changes: `git add . && git commit -m \"feat: Add Sphere {}\"`", sphere_id);
+    println!("   g. Push to your fork: `git push origin add-sphere-{}", sphere_id.replace(|c: char| !c.is_alphanumeric(), "-"));
+    println!("   h. Go to `https://github.com/Nakadra/sphere-hub-registry` and create a Pull Request from your new branch to the main branch of our registry.");
+    println!("\nOur team will review your Pull Request. Thank you for contributing to Sphere!");
+    println!("==========================================================================");
+
+    if !quiet {
+        println!("\n-> Publish preparation complete. Please follow the instructions above.");
+    }
+    Ok(())
+}
 
 // --- Main Application Logic for 'sphere run' ---
 fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
-    // ... (run_sphere function remains largely the same as the previous full version) ...
-    // ... (ensure all its println! calls are wrapped in `if !quiet`) ...
+    // ... (run_sphere function is unchanged from the previous full script) ...
     let content = fs::read_to_string(file_path)
         .map_err(|e| format!("Failed to read sphere file '{}': {}", file_path.display(), e))?;
     let sphere_process: SphereProcess = toml::from_str(&content)
@@ -253,6 +371,9 @@ fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
     
     if !quiet {
         println!("-> Parsed entrypoint: '{}' from '{}'", &sphere_process.entrypoint, file_path.display());
+        if let Some(id) = &sphere_process.id {
+            println!("   Sphere ID: {}", id);
+        }
     }
 
     let mut resolved_deps: Vec<Dependency> = Vec::new();
@@ -268,15 +389,14 @@ fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
              println!("   - Cache index at '{}' is empty or not found.", index_path.display());
         }
 
-
         for (alias, sphere_id) in deps {
             let dep_filename = index.get(sphere_id).ok_or_else(|| {
                 format!("Dependency ID '{}' (aliased as '{}') not found in cache index!", sphere_id, alias)
             })?;
             let dep_path = if Path::new(dep_filename).is_absolute() {
-                PathBuf::from(dep_filename) // It's already an absolute path
+                PathBuf::from(dep_filename)
             } else {
-                cache_dir.join(dep_filename) // It's a relative filename in the cache_dir
+                cache_dir.join(dep_filename)
             };
             
             if !quiet {
@@ -354,7 +474,6 @@ fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
         println!("----------------------");
     }
 
-
     if !output.stderr.is_empty() {
         if !quiet {
             println!("\n--- Command STDERR ---");
@@ -368,6 +487,7 @@ fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+
 // --- Main function: Parses CLI args and dispatches to handlers ---
 fn main() {
     let cli = Cli::parse();
@@ -380,13 +500,16 @@ fn main() {
             CacheAction::List => {
                 handle_cache_list(cli.quiet)
             }
-            CacheAction::Add { id, sphere_file_path, copy_to_cache } => { // Renamed here to match struct
+            CacheAction::Add { id, sphere_file_path, copy_to_cache } => {
                 handle_cache_add(id, sphere_file_path, *copy_to_cache, cli.quiet)
             }
             CacheAction::Remove { id } => {
                 handle_cache_remove(id, cli.quiet)
             }
         },
+        Commands::Publish { file_path } => { 
+            handle_sphere_publish(file_path, cli.quiet)
+        }
     };
 
     if let Err(e) = result {
@@ -394,40 +517,41 @@ fn main() {
         let mut specific_error_handled = false;
         let mut file_path_for_error: Option<String> = None;
 
-        if let Commands::Run { ref file_path } = cli.command {
-            file_path_for_error = Some(file_path.display().to_string());
-        } else if let Commands::Cache { action: CacheAction::Add { ref sphere_file_path, .. } } = cli.command {
-            // For cache add, the relevant path might be the one being added
-             file_path_for_error = Some(sphere_file_path.display().to_string());
+        match &cli.command {
+            Commands::Run { file_path } => {
+                file_path_for_error = Some(file_path.display().to_string());
+            }
+            Commands::Publish { file_path } => {
+                 file_path_for_error = Some(file_path.display().to_string());
+            }
+            Commands::Cache { action } => {
+                if let CacheAction::Add { sphere_file_path, .. } = action {
+                    file_path_for_error = Some(sphere_file_path.display().to_string());
+                }
+            }
         }
-
 
         if let Some(toml_error) = e.downcast_ref::<toml::de::Error>() {
             let path_str = file_path_for_error.as_deref().unwrap_or("the specified .sphere file");
             if toml_error.message().contains("missing field `entrypoint`") {
                 error_message = format!("The file '{}' is missing the required 'entrypoint' field.", path_str);
                 specific_error_handled = true;
-            } else { // Generic TOML error
+            } else { 
                  error_message = format!("Failed to parse TOML from '{}'. Reason: {}", path_str, toml_error);
                  specific_error_handled = true;
             }
         }
         
         if !specific_error_handled {
-            // Avoid prepending "Application error:" if it's already one of our custom, detailed messages
-            if !e.to_string().starts_with("Dependency") && 
-               !e.to_string().starts_with("Failed to read sphere file") && 
-               !e.to_string().starts_with("Failed to parse TOML from") &&
-               !e.to_string().starts_with("Sphere ID") &&
-               !e.to_string().starts_with("Source file") &&
-               !e.to_string().starts_with("A file named") &&
-               !e.to_string().starts_with("Failed to copy") &&
-               !e.to_string().starts_with("Failed to get absolute path") &&
-               !e.to_string().starts_with("Failed to save cache index") &&
-               !e.to_string().starts_with("Failed to parse cache index") &&
-               !e.to_string().starts_with("Could not determine home directory") &&
-               !e.to_string().starts_with("Cannot derive a valid cache filename") {
-                 error_message = format!("Application error: {}", e);
+            let custom_prefixes = [
+                "Dependency", "Failed to read sphere file", "Failed to parse TOML from",
+                "Sphere ID", "Source file", "A file named", "Failed to copy",
+                "Failed to get absolute path", "Failed to save cache index",
+                "Failed to parse cache index", "Could not determine home directory", // Corrected: no double underscore
+                "Cannot derive a valid cache filename"
+            ];
+            if !custom_prefixes.iter().any(|p| e.to_string().starts_with(p)) {
+                error_message = format!("Application error: {}", e);
             }
         }
         
