@@ -1,0 +1,2 @@
+id = "com.mytools.supertool/v1.0.0"
+entrypoint = "echo 'SuperTool v1.0 is running!'"

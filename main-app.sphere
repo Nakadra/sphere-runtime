@@ -1,5 +1,5 @@
-id = "com.apps.main-app/v1"
+id = "com.apps.main-app/v1.0.0" 
 entrypoint = "echo 'Main app starting...'; greeter-v1; echo 'Main app finished.'"
 
 [dependencies]
-greeter-v1 = "com.util.greeter/v1"
+greeter-v1 = "com.util.greeter/v1.0.0" 

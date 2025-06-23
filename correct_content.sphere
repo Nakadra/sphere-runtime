@@ -1,0 +1,2 @@
+id = "com.example.hub-greeter/v1.0.0"
+entrypoint = "echo 'Hello from the SphereHub! This is the public greeter.'"

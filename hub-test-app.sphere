@@ -1,0 +1,5 @@
+id = "com.local.hubconsumer/v1"
+entrypoint = "echo 'Local app starting...'; public_greeting_tool; echo 'Local app finished.'"
+
+[dependencies]
+public_greeting_tool = "com.example.hub-greeter/v1.0.0" 

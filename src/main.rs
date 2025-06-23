@@ -1,15 +1,20 @@
 // --- Imports ---
 use clap::{Parser, Subcommand};
 use serde::Deserialize;
-use serde_json;
+// serde_json is used via its full path like serde_json::from_str, so top-level import removed by clippy
 use std::collections::HashMap;
 use std::fs;
-use std::io::{self, BufRead, Write}; // Added BufRead for stdin, Write for stdout().flush()
+use std::io::{self, BufRead, Write}; 
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::tempdir;
-use sha2::{Sha256, Digest}; // For SHA256 hashing
+use sha2::{Digest, Sha256};
+use reqwest::blocking::Client;
+
+// --- Constants ---
+const SPHEREHUB_REGISTRY_URL: &str = "https://raw.githubusercontent.com/Nakadra/sphere-hub-registry/main/registry/";
+
 
 // --- CLI Definition using clap ---
 #[derive(Parser, Debug)]
@@ -71,7 +76,7 @@ enum CacheAction {
 // --- Data Structures for Sphere ---
 #[derive(Deserialize, Debug)]
 struct SphereProcess {
-    id: Option<String>, 
+    id: Option<String>,
     entrypoint: String,
     dependencies: Option<HashMap<String, String>>,
 }
@@ -80,6 +85,15 @@ struct Dependency {
     alias: String,
     process: SphereProcess,
 }
+
+#[derive(Deserialize, Debug, Clone)] 
+struct HubSphereInfo {
+    filename: String,
+    description: String,
+    author: String,
+    hash_sha256: String,
+}
+
 
 // --- Helper Functions for Cache Management ---
 fn get_cache_paths() -> Result<(PathBuf, PathBuf), Box<dyn Error>> {
@@ -111,20 +125,6 @@ fn save_cache_index(index_path: &Path, index: &HashMap<String, String>) -> Resul
         .map_err(|e| format!("Failed to save cache index to '{}': {}", index_path.display(), e))?;
     Ok(())
 }
-
-// --- Helper function for user input ---
-fn prompt_for_input(prompt_message: &str) -> Result<String, Box<dyn Error>> {
-    print!("{}", prompt_message);
-    io::stdout().flush()?; 
-    let mut input = String::new();
-    io::stdin().lock().read_line(&mut input)?;
-    let trimmed_input = input.trim().to_string();
-    if trimmed_input.is_empty() {
-        return Err("Input cannot be empty.".into());
-    }
-    Ok(trimmed_input)
-}
-
 
 // --- Cache Command Handlers ---
 fn handle_cache_list(quiet: bool) -> Result<(), Box<dyn Error>> {
@@ -235,19 +235,16 @@ fn handle_cache_remove(id: &str, quiet: bool) -> Result<(), Box<dyn Error>> {
     if !index.contains_key(id) {
         return Err(format!("Sphere ID '{}' not found in the cache index. Nothing to remove.", id).into());
     }
-    let removed_file_path_str = index.remove(id); // .remove() returns Option<String>
+    let removed_file_path = index.remove(id);
     save_cache_index(&index_path, &index)?;
 
     if !quiet {
         println!("   Successfully removed Sphere ID '{}' from the index.", id);
-        if let Some(path_str) = removed_file_path_str { 
+        if let Some(path_str) = removed_file_path {
             let path_obj = Path::new(&path_str);
-            // A simple heuristic: if it doesn't contain typical absolute path indicators and is not empty
-            let probably_copied_to_cache = !path_str.starts_with('/') && !path_str.starts_with('~') && !path_obj.is_absolute();
-
-            if probably_copied_to_cache {
-                 println!("   Note: The associated file entry was '{}'. If this was copied to cache, the file itself was NOT deleted.", path_str);
-                 println!("   You may want to remove it manually from: {}/{}", _cache_dir.display(), path_str);
+            if path_obj.is_relative() && !path_str.starts_with('/') && !path_str.starts_with('~') {
+                 println!("   Note: The associated file '{}' in the cache directory was NOT deleted.", path_str);
+                 println!("   If it was copied to cache, you may want to remove it manually from: {}/{}", _cache_dir.display(), path_str);
             } else {
                  println!("   Note: The index entry pointed to an external file at '{}'. This file was NOT deleted.", path_str);
             }
@@ -264,50 +261,57 @@ fn handle_sphere_publish(file_path: &PathBuf, quiet: bool) -> Result<(), Box<dyn
         println!("---");
     }
 
-    // 1. Validate file_path exists and is a file.
     if !file_path.exists() {
-        return Err(format!("Sphere file '{}' does not exist.", file_path.display()).into());
+        return Err(format!("Sphere file '{}' not found.", file_path.display()).into());
     }
     if !file_path.is_file() {
         return Err(format!("Path '{}' is not a file.", file_path.display()).into());
     }
 
-    // 2. Parse .sphere file into SphereProcess.
-    let sphere_content_str = fs::read_to_string(file_path)
+    let content_string = fs::read_to_string(file_path)
         .map_err(|e| format!("Failed to read sphere file '{}': {}", file_path.display(), e))?;
-    let sphere_process: SphereProcess = toml::from_str(&sphere_content_str)
+    let sphere_process: SphereProcess = toml::from_str(&content_string)
         .map_err(|e| format!("Failed to parse TOML from '{}': {}", file_path.display(), e))?;
 
-    // 3. Validate 'id' field.
     let sphere_id = match &sphere_process.id {
-        Some(id_str) if !id_str.trim().is_empty() => id_str.trim().to_string(),
+        Some(id_val) if !id_val.trim().is_empty() => id_val.trim().to_string(),
         _ => return Err(format!(
-            "The .sphere file at '{}' must contain a valid, non-empty 'id' field (e.g., 'com.example/my-tool/v1.0.0') for publishing.",
+            "The .sphere file '{}' must contain a valid, non-empty 'id' field for publishing.",
             file_path.display()
         ).into()),
     };
     
     if !quiet {
-        println!("   Publishing Sphere with ID: {}", sphere_id);
+        println!("   Successfully parsed Sphere. ID: {}", sphere_id);
     }
 
-    // 4. Prompt user for Author/Maintainer.
-    let author = prompt_for_input("   Enter your GitHub username or author name for this Sphere: ")?;
+    let author = {
+        print!("   Enter your GitHub username or author name for this Sphere: ");
+        io::stdout().flush()?; 
+        let mut buffer = String::new();
+        io::stdin().lock().read_line(&mut buffer)?;
+        let name = buffer.trim();
+        if name.is_empty() { "UnknownAuthor".to_string() } else { name.to_string() }
+    };
 
-    // 5. Prompt user for Description.
-    let description = prompt_for_input("   Enter a short, one-line description for this Sphere: ")?;
-
-    // 6. Calculate SHA256 hash of the file content.
-    let mut hasher = Sha256::new();
-    hasher.update(sphere_content_str.as_bytes());
-    let hash_bytes = hasher.finalize();
-    let hash_hex = format!("{:x}", hash_bytes); 
+    let description = {
+        print!("   Enter a short, one-line description for this Sphere: ");
+        io::stdout().flush()?;
+        let mut buffer = String::new();
+        io::stdin().lock().read_line(&mut buffer)?;
+        let desc = buffer.trim();
+        if desc.is_empty() { "No description provided.".to_string() } else { desc.to_string() }
+    };
     
     if !quiet {
-        println!("   Calculated SHA256 hash: {}", hash_hex);
+        println!("---");
     }
 
-    // 7. Derive cached filename from Sphere ID.
+    let mut hasher = Sha256::new();
+    hasher.update(content_string.as_bytes());
+    let hash_bytes = hasher.finalize();
+    let hash_hex = format!("{:x}", hash_bytes);
+
     let mut derived_filename = sphere_id.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-', "_");
     if !derived_filename.ends_with(".sphere") {
         derived_filename.push_str(".sphere");
@@ -315,55 +319,112 @@ fn handle_sphere_publish(file_path: &PathBuf, quiet: bool) -> Result<(), Box<dyn
     if derived_filename == ".sphere" || derived_filename.is_empty() {
          derived_filename = format!("sphere_{}.sphere", sphere_id.chars().filter(|c| c.is_alphanumeric()).collect::<String>());
          if derived_filename == "sphere_.sphere" {
-             return Err("Cannot derive a valid cache filename from the Sphere ID. Please use an ID with alphanumeric characters.".into());
+             return Err("Cannot derive a valid filename for SphereHub from the provided ID. Please use an ID with alphanumeric characters.".into());
          }
     }
-    
-    if !quiet {
-        println!("   Derived filename for SphereHub: {}", derived_filename);
-        println!("---");
-    }
 
-    // 8. Print detailed PR instructions.
-    println!("\n===== Sphere Publishing Instructions (Manual PR Required for MVP) =====");
-    println!("Sphere CLI has prepared the following information for your Sphere '{}':", sphere_id);
-    println!("\n1. Sphere ID:      {}", sphere_id);
-    println!("2. Author:         {}", author);
-    println!("3. Description:    {}", description);
-    println!("4. Content SHA256: {}", hash_hex);
-    println!("5. Hub Filename:   {}", derived_filename);
-    println!("\nTo publish this Sphere to the public SphereHub registry (https://github.com/Nakadra/sphere-hub-registry), please follow these steps:");
-    println!("   a. Fork the repository `Nakadra/sphere-hub-registry` to your own GitHub account if you haven't already.");
-    println!("   b. Clone your fork locally: `git clone https://github.com/YOUR_USERNAME/sphere-hub-registry.git`");
-    println!("   c. Create a new branch in your fork: `git checkout -b add-sphere-{}", sphere_id.replace(|c: char| !c.is_alphanumeric(), "-")); // Sanitize for branch name
-    println!("   d. Add your Sphere file content:");
-    println!("      - Create/edit the file in your cloned fork: `registry/spheres/{}`", derived_filename);
-    println!("      - Paste the exact content of your original '{}' into this new file.", file_path.display());
-    println!("   e. Update the master index:");
-    println!("      - Open the file: `registry/index.json` in your fork.");
-    println!("      - Add a new entry for your Sphere. Ensure it's valid JSON. If adding to an existing JSON object, add a comma before your new key if needed.");
-    println!("        Your entry should look like this (adjust formatting as needed):");
-    println!("        \"{}\": {{", sphere_id); // Key
-    println!("          \"filename\": \"{}\",", derived_filename);
-    println!("          \"description\": \"{}\",", description);
-    println!("          \"author\": \"{}\",", author);
-    println!("          \"hash_sha256\": \"{}\"", hash_hex);
-    println!("        }}");
-    println!("   f. Commit your changes: `git add . && git commit -m \"feat: Add Sphere {}\"`", sphere_id);
-    println!("   g. Push to your fork: `git push origin add-sphere-{}", sphere_id.replace(|c: char| !c.is_alphanumeric(), "-"));
-    println!("   h. Go to `https://github.com/Nakadra/sphere-hub-registry` and create a Pull Request from your new branch to the main branch of our registry.");
-    println!("\nOur team will review your Pull Request. Thank you for contributing to Sphere!");
-    println!("==========================================================================");
+    println!("\n--- How to Publish '{}' to SphereHub ---", sphere_id);
+    println!("SphereHub Registry: https://github.com/Nakadra/sphere-hub-registry\n");
+    println!("1. Fork the SphereHub Registry repository to your GitHub account.");
+    println!("2. Clone your fork locally: `git clone https://github.com/YOUR_USERNAME/sphere-hub-registry.git`");
+    println!("3. Create a new branch: `git checkout -b add-sphere-{}`", sphere_id.chars().take(15).filter(|c| c.is_alphanumeric()).collect::<String>());
+    println!("\n4. Create/Update the Sphere file in your fork:");
+    println!("   - Path: `registry/spheres/{}`", derived_filename);
+    println!("   - Content: (Copy the exact content of your local '{}' file into this new file)\n", file_path.display());
+    println!("5. Add/Update the entry in `registry/index.json` in your fork:");
+    println!("   Ensure the JSON is valid. Add your Sphere entry like this (add a comma if needed):");
+    println!("   ```json");
+    println!("   \"{}\": {{", sphere_id);
+    println!("     \"filename\": \"{}\",", derived_filename);
+    println!("     \"description\": \"{}\",", description);
+    println!("     \"author\": \"{}\",", author);
+    println!("     \"hash_sha256\": \"{}\"", hash_hex);
+    println!("   }}");
+    println!("   ```\n");
+    println!("6. Commit your changes: `git add . && git commit -m \"feat: Add Sphere {} \"`", sphere_id);
+    println!("7. Push to your fork: `git push origin add-sphere-{}`", sphere_id.chars().take(15).filter(|c| c.is_alphanumeric()).collect::<String>());
+    println!("8. Go to `https://github.com/Nakadra/sphere-hub-registry` and click 'New Pull Request'. Choose your fork and branch.\n");
+    println!("The Sphere maintainers (Clein, Kelly, Ronald) will review your PR. Thank you for contributing!");
+    println!("---");
 
     if !quiet {
-        println!("\n-> Publish preparation complete. Please follow the instructions above.");
+        println!("-> Publish preparation complete. Please follow the instructions above.");
     }
     Ok(())
 }
 
+// --- SphereHub Fetching Logic ---
+fn fetch_sphere_from_hub(
+    sphere_id: &str,
+    local_cache_dir: &Path,
+    local_index_path: &Path,
+    local_index: &mut HashMap<String, String>, 
+    http_client: &Client,
+    quiet: bool,
+) -> Result<PathBuf, Box<dyn Error>> {
+    if !quiet {
+        println!("   -> Dependency '{}' not in local cache. Attempting to fetch from SphereHub...", sphere_id);
+    }
+
+    let master_index_url = format!("{}index.json", SPHEREHUB_REGISTRY_URL);
+    let response = http_client.get(&master_index_url).send()?;
+    if !response.status().is_success() {
+        return Err(format!("Failed to fetch SphereHub master index from '{}': HTTP {}", master_index_url, response.status()).into());
+    }
+    let response_text = response.text()?;
+    
+    let master_index: HashMap<String, HubSphereInfo> = serde_json::from_str(&response_text)
+        .map_err(|e| format!("Failed to parse SphereHub master index: {}. Content: '{}'", e, response_text))?;
+
+    let hub_info = master_index.get(sphere_id).ok_or_else(|| {
+        format!("Sphere ID '{}' not found in the public SphereHub registry at {}.", sphere_id, master_index_url)
+    })?;
+
+    if !quiet {
+        println!("   -> Found '{}' in SphereHub. Filename: {}, Author: {}, Desc: {}, Hash: {}...", 
+                 sphere_id, hub_info.filename, hub_info.author, hub_info.description, &hub_info.hash_sha256[..8]);
+    }
+
+    let sphere_file_url = format!("{}spheres/{}", SPHEREHUB_REGISTRY_URL, hub_info.filename);
+    let sphere_file_response = http_client.get(&sphere_file_url).send()?;
+     if !sphere_file_response.status().is_success() {
+        return Err(format!("Failed to fetch Sphere file '{}' from '{}': HTTP {}", hub_info.filename, sphere_file_url, sphere_file_response.status()).into());
+    }
+    let sphere_file_content_bytes = sphere_file_response.bytes()?;
+
+
+    let mut hasher = Sha256::new();
+    hasher.update(&sphere_file_content_bytes);
+    let calculated_hash_bytes = hasher.finalize();
+    let calculated_hash_hex = format!("{:x}", calculated_hash_bytes);
+
+    if calculated_hash_hex != hub_info.hash_sha256 {
+        return Err(format!(
+            "Hash mismatch for Sphere '{}' (file '{}')! Expected: {}, Got: {}. File may be corrupted or tampered.",
+            sphere_id, hub_info.filename, hub_info.hash_sha256, calculated_hash_hex
+        ).into());
+    }
+    if !quiet {
+        println!("   -> Hash verification successful for '{}'.", sphere_id);
+    }
+
+    let local_sphere_file_path = local_cache_dir.join(&hub_info.filename);
+    fs::write(&local_sphere_file_path, &sphere_file_content_bytes)
+        .map_err(|e| format!("Failed to save downloaded Sphere '{}' to local cache ('{}'): {}", sphere_id, local_sphere_file_path.display(), e))?;
+    
+    local_index.insert(sphere_id.to_string(), hub_info.filename.clone()); 
+    save_cache_index(local_index_path, local_index)?; 
+
+    if !quiet {
+        println!("   -> Successfully downloaded, verified, and cached '{}' to '{}'.", sphere_id, local_sphere_file_path.display());
+    }
+    
+    Ok(local_sphere_file_path)
+}
+
+
 // --- Main Application Logic for 'sphere run' ---
 fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
-    // ... (run_sphere function is unchanged from the previous full script) ...
     let content = fs::read_to_string(file_path)
         .map_err(|e| format!("Failed to read sphere file '{}': {}", file_path.display(), e))?;
     let sphere_process: SphereProcess = toml::from_str(&content)
@@ -381,41 +442,66 @@ fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
         if !quiet {
             println!("-> Resolving dependencies...");
         }
-        let (cache_dir, index_path) = get_cache_paths()?;
-        let index = load_cache_index(&index_path)?;
-        if !quiet && !index.is_empty() {
-             println!("   - Loaded cache index from '{}'.", index_path.display());
-        } else if !quiet && index.is_empty() {
-             println!("   - Cache index at '{}' is empty or not found.", index_path.display());
+        let (cache_dir, local_index_path) = get_cache_paths()?;
+        let mut local_index = load_cache_index(&local_index_path)?;
+        
+        if !quiet && !local_index.is_empty() {
+             println!("   - Loaded local cache index from '{}'.", local_index_path.display());
+        } else if !quiet && local_index.is_empty() {
+             println!("   - Local cache index at '{}' is empty or not found.", local_index_path.display());
         }
+        
+        let http_client = Client::builder()
+            .user_agent(format!("sphere-cli/{}", env!("CARGO_PKG_VERSION")))
+            .build()?;
 
         for (alias, sphere_id) in deps {
-            let dep_filename = index.get(sphere_id).ok_or_else(|| {
-                format!("Dependency ID '{}' (aliased as '{}') not found in cache index!", sphere_id, alias)
-            })?;
-            let dep_path = if Path::new(dep_filename).is_absolute() {
-                PathBuf::from(dep_filename)
+            let dep_path: PathBuf; // Removed 'mut' as per clippy
+
+            if let Some(dep_filename_in_local_cache) = local_index.get(sphere_id) {
+                let current_dep_path = if Path::new(dep_filename_in_local_cache).is_absolute() {
+                    PathBuf::from(dep_filename_in_local_cache)
+                } else {
+                    cache_dir.join(dep_filename_in_local_cache)
+                };
+
+                if !current_dep_path.exists() {
+                    if !quiet {
+                        println!("   - Dependency '{}' (Sphere ID: '{}') found in local index but file missing at '{}'. Attempting Hub fetch.", alias, sphere_id, current_dep_path.display());
+                    }
+                    dep_path = fetch_sphere_from_hub(sphere_id, &cache_dir, &local_index_path, &mut local_index, &http_client, quiet)?;
+                } else {
+                    if !quiet {
+                        println!("   - Using locally cached dependency '{}' (Sphere ID: '{}') from '{}'", alias, sphere_id, current_dep_path.display());
+                    }
+                    dep_path = current_dep_path;
+                }
             } else {
-                cache_dir.join(dep_filename)
-            };
+                dep_path = fetch_sphere_from_hub(sphere_id, &cache_dir, &local_index_path, &mut local_index, &http_client, quiet)?;
+            }
             
-            if !quiet {
-                println!("   - Loading dependency '{}' (Sphere ID: '{}') from '{}'", alias, sphere_id, dep_path.display());
+            if !quiet && dep_path.exists() {
+                println!("   - Loading dependency definition for '{}' from '{}'", alias, dep_path.display());
+            } else if !dep_path.exists() {
+                 return Err(format!("Failed to obtain dependency '{}' (Sphere ID: '{}'). Expected at '{}' after attempting local cache and Hub fetch.", alias, sphere_id, dep_path.display()).into());
             }
 
             let dep_content = fs::read_to_string(&dep_path)
                 .map_err(|e| {
                     if e.kind() == std::io::ErrorKind::NotFound {
-                        Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!(
-                            "Dependency file '{}' (for Sphere ID '{}', aliased as '{}') not found at expected path '{}'. Please ensure it is installed correctly or the path in index.json is correct.",
-                            dep_filename, sphere_id, alias, dep_path.display()
+                        Box::new(std::io::Error::other(format!( // Used Error::other
+                            "Dependency file for '{}' (Sphere ID: '{}', alias: '{}') not found at expected path '{}' even after cache/Hub check. This indicates an inconsistency.",
+                            dep_path.display(), sphere_id, alias, dep_path.display()
                         ))) as Box<dyn Error>
                     } else {
-                        Box::new(e) as Box<dyn Error>
+                        Box::new(std::io::Error::other(format!( // Used Error::other
+                            "Failed to read dependency file '{}' (Sphere ID: '{}', alias: '{}'): {}", 
+                            dep_path.display(), sphere_id, alias, e
+                        ))) as Box<dyn Error>
                     }
                 })?;
             let dep_process: SphereProcess = toml::from_str(&dep_content)
-                .map_err(|e| format!("Failed to parse TOML for dependency '{}' (file: {}): {}", sphere_id, dep_filename, e))?;
+                .map_err(|e| format!("Failed to parse TOML for dependency '{}' (file: {}): {}", sphere_id, dep_path.display(), e))?;
 
             resolved_deps.push(Dependency {
                 alias: alias.clone(),
@@ -487,7 +573,6 @@ fn run_sphere(file_path: &Path, quiet: bool) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-
 // --- Main function: Parses CLI args and dispatches to handlers ---
 fn main() {
     let cli = Cli::parse();
@@ -547,10 +632,13 @@ fn main() {
                 "Dependency", "Failed to read sphere file", "Failed to parse TOML from",
                 "Sphere ID", "Source file", "A file named", "Failed to copy",
                 "Failed to get absolute path", "Failed to save cache index",
-                "Failed to parse cache index", "Could not determine home directory", // Corrected: no double underscore
-                "Cannot derive a valid cache filename"
+                "Failed to parse cache index", "Could not determine home directory",
+                "Cannot derive a valid cache filename", "Failed to fetch SphereHub master index",
+                /* "Sphere ID" is too generic, use more specific part of the error message */
+                "not found in the public SphereHub registry", "Failed to fetch Sphere file",
+                "Hash mismatch for Sphere", "Failed to save downloaded Sphere"
             ];
-            if !custom_prefixes.iter().any(|p| e.to_string().starts_with(p)) {
+            if !custom_prefixes.iter().any(|p| e.to_string().contains(p)) { // Changed to .contains() for broader matching
                 error_message = format!("Application error: {}", e);
             }
         }
